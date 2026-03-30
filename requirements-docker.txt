@@ -1,0 +1,25 @@
+# Core scientific stack
+numpy
+scipy
+pandas
+matplotlib
+
+# ML frameworks
+scikit-learn
+xgboost<3
+catboost
+torch
+pytorch-lightning
+torchmetrics
+
+# Mass spectrometry
+# pyopenms excluded: no manylinux aarch64 wheel; only needed for file I/O
+pyteomics
+chemparse
+
+# Web server
+fastapi
+uvicorn[standard]
+
+# Misc
+tqdm
