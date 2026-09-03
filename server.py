@@ -3,7 +3,8 @@ import math
 import os
 import sys
 import types
-from typing import List, Optional
+import uuid
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -39,6 +40,10 @@ deisotoping_models: dict = {}
 mlp_model: MLP = None
 mlp_vector_length: int = 500  # will be set from checkpoint hparams
 
+# --- Server-side spectrum store ---
+
+spectra_store: Dict[str, dict] = {}
+
 
 @app.on_event("startup")
 def load_models():
@@ -65,8 +70,6 @@ def load_models():
         mlp_model.eval()
         logger.info("  MLP loaded")
     except Exception:
-        # load_from_checkpoint can fail due to torchmetrics incompatibility,
-        # weights_only default changes, etc. Fall back to manual loading.
         logger.info("  Retrying MLP load (inference-only fallback)...")
         checkpoint = torch.load(
             "nn_models/regression/mlp_0.25.ckpt",
@@ -81,12 +84,10 @@ def load_models():
         hidden_size = hparams.get("hidden_size", 50)
         activation = hparams.get("activation", True)
 
-        # Build a minimal MLP with only the forward-pass layers, no metrics
         mlp_model = torch.nn.Module()
         mlp_model.mlp = LinearWithHidden(in_size, hidden_size, Element.n_elements, activation)
         mlp_model.forward = lambda x: mlp_model.mlp(x)
 
-        # Load matching weights
         state_dict = {k: v for k, v in checkpoint["state_dict"].items()
                       if k.startswith("mlp.")}
         mlp_model.load_state_dict(state_dict)
@@ -97,25 +98,46 @@ def load_models():
         logger.warning(f"  Could not load MLP: {e}")
 
 
+# --- Helpers ---
+
+
+def _resolve_spectrum(masses, intensities, spectrum_id) -> Spectrum:
+    if spectrum_id:
+        entry = spectra_store.get(spectrum_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"Unknown spectrum_id: {spectrum_id}")
+        return entry["spectrum"]
+    if not masses or not intensities:
+        raise HTTPException(status_code=400, detail="Provide either spectrum_id or both masses and intensities")
+    if len(masses) != len(intensities):
+        raise HTTPException(
+            status_code=400,
+            detail=f"masses ({len(masses)}) and intensities ({len(intensities)}) must have the same length",
+        )
+    return Spectrum(masses=np.array(masses), ints=np.array(intensities))
+
+
 # --- Request / Response schemas ---
 
 
 class DeisotopeRequest(BaseModel):
-    masses: List[float]
-    intensities: List[float]
-    model: str = "xgb"
+    spectrum_id: Optional[str] = None
+    masses: Optional[List[float]] = None
+    intensities: Optional[List[float]] = None
+    model: str = "cb"
     threshold: float = 0.5
 
 
 class DeisotopeResponse(BaseModel):
     labels: List[int]
-    peak_masses: List[float]
-    peak_intensities: List[float]
+    num_clusters: int
+    num_peaks: int
 
 
 class CheckFormulaRequest(BaseModel):
-    masses: List[float]
-    intensities: List[float]
+    spectrum_id: Optional[str] = None
+    masses: Optional[List[float]] = None
+    intensities: Optional[List[float]] = None
     formula: str
     charge: int = 1
     cal_error: Optional[float] = None
@@ -131,8 +153,9 @@ class CheckFormulaResponse(BaseModel):
 
 
 class PredictFormulaRequest(BaseModel):
-    masses: List[float]
-    intensities: List[float]
+    spectrum_id: Optional[str] = None
+    masses: Optional[List[float]] = None
+    intensities: Optional[List[float]] = None
     peak_indices: List[int]
 
 
@@ -153,11 +176,10 @@ class LoadPeaklistRequest(BaseModel):
 
 
 class LoadPeaklistResponse(BaseModel):
+    spectrum_id: str
     num_peaks: int
     mass_range: List[float]
     max_intensity: float
-    masses: List[float]
-    intensities: List[float]
     columns: List[str]
 
 
@@ -170,48 +192,35 @@ def health():
         "status": "ok",
         "deisotoping_models": list(deisotoping_models.keys()),
         "mlp_loaded": mlp_model is not None,
+        "loaded_spectra": len(spectra_store),
     }
 
 
 @app.post("/deisotope", response_model=DeisotopeResponse)
 def deisotope(req: DeisotopeRequest):
-    if len(req.masses) != len(req.intensities):
-        raise HTTPException(
-            status_code=400,
-            detail=f"masses ({len(req.masses)}) and intensities ({len(req.intensities)}) must have the same length",
-        )
+    spectrum = _resolve_spectrum(req.masses, req.intensities, req.spectrum_id)
+
     if req.model not in deisotoping_models:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown model '{req.model}'. Available: {list(deisotoping_models.keys())}",
         )
 
-    spectrum = Spectrum(
-        masses=np.array(req.masses),
-        ints=np.array(req.intensities),
-    )
-
     deisotoper = deisotoping_models[req.model]
     labels = deisotoper.run(spectrum, threshold=req.threshold)
+    labels_list = [int(l) for l in labels]
+    num_clusters = len(set(l for l in labels_list if l >= 0))
 
     return DeisotopeResponse(
-        labels=[int(l) for l in labels],
-        peak_masses=req.masses,
-        peak_intensities=req.intensities,
+        labels=labels_list,
+        num_clusters=num_clusters,
+        num_peaks=len(labels_list),
     )
 
 
 @app.post("/check-formula", response_model=CheckFormulaResponse)
 def check_formula(req: CheckFormulaRequest):
-    if len(req.masses) != len(req.intensities):
-        raise HTTPException(
-            status_code=400,
-            detail=f"masses ({len(req.masses)}) and intensities ({len(req.intensities)}) must have the same length",
-        )
-    spectrum = Spectrum(
-        masses=np.array(req.masses),
-        ints=np.array(req.intensities),
-    )
+    spectrum = _resolve_spectrum(req.masses, req.intensities, req.spectrum_id)
     formula = Formula(req.formula, charge=req.charge)
 
     kwargs = {}
@@ -244,39 +253,26 @@ def check_formula(req: CheckFormulaRequest):
 
 @app.post("/predict-formula", response_model=PredictFormulaResponse)
 def predict_formula(req: PredictFormulaRequest):
-    if len(req.masses) != len(req.intensities):
-        raise HTTPException(
-            status_code=400,
-            detail=f"masses ({len(req.masses)}) and intensities ({len(req.intensities)}) must have the same length",
-        )
+    spectrum = _resolve_spectrum(req.masses, req.intensities, req.spectrum_id)
+
     if mlp_model is None:
         raise HTTPException(status_code=503, detail="MLP model not loaded")
 
-    spectrum = Spectrum(
-        masses=np.array(req.masses),
-        ints=np.array(req.intensities),
-    )
-
     rid = RealIsotopicDistribution(spectrum, req.peak_indices)
-    # vectorize() produces n_bins-1 elements, so pass length+1 to get the
-    # correct input dimension for the MLP.
     representations = rid.get_representation(length=mlp_vector_length + 1)
 
-    # Stack all peak vectors into a single input tensor
     vectors = [rep[0] for rep in representations]
     input_tensor = torch.tensor(np.array(vectors), dtype=torch.float32)
 
     with torch.no_grad():
         output = mlp_model(input_tensor)
 
-    # Average predictions across peaks in the cluster
     avg_output = output.mean(dim=0).numpy()
 
-    # Map to element symbols, filtering to significant predictions
     elements = []
     for idx in range(len(avg_output)):
         count = float(avg_output[idx])
-        element_number = idx + 1  # ELEMENT_DICT keys are 1-indexed
+        element_number = idx + 1
         if count > 0.5 and element_number in ELEMENT_DICT:
             elements.append(
                 ElementPrediction(symbol=ELEMENT_DICT[element_number], count=count)
@@ -333,17 +329,22 @@ def load_peaklist(req: LoadPeaklistRequest):
         )
 
     df = df.dropna(subset=[mass_col, int_col])
-    masses = df[mass_col].astype(float).tolist()
-    intensities = df[int_col].astype(float).tolist()
+    masses = df[mass_col].astype(float).values
+    intensities = df[int_col].astype(float).values
 
     if len(masses) == 0:
         raise HTTPException(status_code=422, detail="No valid peaks found in file")
 
+    sid = uuid.uuid4().hex[:12]
+    spectra_store[sid] = {
+        "spectrum": Spectrum(masses=masses, ints=intensities),
+        "file": fp,
+    }
+
     return LoadPeaklistResponse(
+        spectrum_id=sid,
         num_peaks=len(masses),
-        mass_range=[min(masses), max(masses)],
-        max_intensity=max(intensities),
-        masses=masses,
-        intensities=intensities,
+        mass_range=[float(masses.min()), float(masses.max())],
+        max_intensity=float(intensities.max()),
         columns=list(df.columns),
     )
