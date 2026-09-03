@@ -175,6 +175,11 @@ def health():
 
 @app.post("/deisotope", response_model=DeisotopeResponse)
 def deisotope(req: DeisotopeRequest):
+    if len(req.masses) != len(req.intensities):
+        raise HTTPException(
+            status_code=400,
+            detail=f"masses ({len(req.masses)}) and intensities ({len(req.intensities)}) must have the same length",
+        )
     if req.model not in deisotoping_models:
         raise HTTPException(
             status_code=400,
@@ -198,6 +203,11 @@ def deisotope(req: DeisotopeRequest):
 
 @app.post("/check-formula", response_model=CheckFormulaResponse)
 def check_formula(req: CheckFormulaRequest):
+    if len(req.masses) != len(req.intensities):
+        raise HTTPException(
+            status_code=400,
+            detail=f"masses ({len(req.masses)}) and intensities ({len(req.intensities)}) must have the same length",
+        )
     spectrum = Spectrum(
         masses=np.array(req.masses),
         ints=np.array(req.intensities),
@@ -234,6 +244,11 @@ def check_formula(req: CheckFormulaRequest):
 
 @app.post("/predict-formula", response_model=PredictFormulaResponse)
 def predict_formula(req: PredictFormulaRequest):
+    if len(req.masses) != len(req.intensities):
+        raise HTTPException(
+            status_code=400,
+            detail=f"masses ({len(req.masses)}) and intensities ({len(req.intensities)}) must have the same length",
+        )
     if mlp_model is None:
         raise HTTPException(status_code=503, detail="MLP model not loaded")
 
