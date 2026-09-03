@@ -7,7 +7,11 @@ from typing import Optional, Callable, Hashable
 
 import numpy as np
 import pandas as pd
-from pyopenms import MSExperiment, MzXMLFile
+try:
+    from pyopenms import MSExperiment, MzXMLFile
+except ImportError:
+    MSExperiment = None
+    MzXMLFile = None
 from tqdm.autonotebook import tqdm
 
 from .utils import lorentzian
