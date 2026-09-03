@@ -1,10 +1,12 @@
 import logging
 import math
+import os
 import sys
 import types
 from typing import List, Optional
 
 import numpy as np
+import pandas as pd
 import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -143,6 +145,22 @@ class PredictFormulaResponse(BaseModel):
     elements: List[ElementPrediction]
 
 
+class LoadPeaklistRequest(BaseModel):
+    file_path: str
+    mass_column: Optional[str] = None
+    intensity_column: Optional[str] = None
+    sheet_name: Optional[str] = None
+
+
+class LoadPeaklistResponse(BaseModel):
+    num_peaks: int
+    mass_range: List[float]
+    max_intensity: float
+    masses: List[float]
+    intensities: List[float]
+    columns: List[str]
+
+
 # --- Endpoints ---
 
 
@@ -250,3 +268,67 @@ def predict_formula(req: PredictFormulaRequest):
             )
 
     return PredictFormulaResponse(elements=elements)
+
+
+MASS_COLUMN_NAMES = ["m/z", "mz", "mass", "t_mass", "measured mass", "obs. m/z", "m_z"]
+INTENSITY_COLUMN_NAMES = ["intensity", "int", "i", "abs. intensity", "rel. intensity", "height"]
+
+
+def _guess_column(columns, candidates):
+    lower = {c.lower().strip(): c for c in columns}
+    for name in candidates:
+        if name in lower:
+            return lower[name]
+    return None
+
+
+@app.post("/load-peaklist", response_model=LoadPeaklistResponse)
+def load_peaklist(req: LoadPeaklistRequest):
+    fp = req.file_path
+    if not os.path.exists(fp):
+        raise HTTPException(status_code=404, detail=f"File not found: {fp}")
+
+    ext = os.path.splitext(fp)[1].lower()
+    try:
+        if ext in (".xlsx", ".xls"):
+            df = pd.read_excel(fp, sheet_name=req.sheet_name or 0)
+        elif ext == ".csv":
+            df = pd.read_csv(fp)
+        elif ext in (".tsv", ".txt"):
+            df = pd.read_csv(fp, sep="\t")
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported format: {ext}. Use .xlsx, .csv, or .tsv")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Failed to read file: {e}")
+
+    mass_col = req.mass_column or _guess_column(df.columns, MASS_COLUMN_NAMES)
+    int_col = req.intensity_column or _guess_column(df.columns, INTENSITY_COLUMN_NAMES)
+
+    if mass_col is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not identify mass column. Columns: {list(df.columns)}. Set mass_column explicitly.",
+        )
+    if int_col is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not identify intensity column. Columns: {list(df.columns)}. Set intensity_column explicitly.",
+        )
+
+    df = df.dropna(subset=[mass_col, int_col])
+    masses = df[mass_col].astype(float).tolist()
+    intensities = df[int_col].astype(float).tolist()
+
+    if len(masses) == 0:
+        raise HTTPException(status_code=422, detail="No valid peaks found in file")
+
+    return LoadPeaklistResponse(
+        num_peaks=len(masses),
+        mass_range=[min(masses), max(masses)],
+        max_intensity=max(intensities),
+        masses=masses,
+        intensities=intensities,
+        columns=list(df.columns),
+    )
