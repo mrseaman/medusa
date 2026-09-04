@@ -128,10 +128,19 @@ class DeisotopeRequest(BaseModel):
     threshold: float = 0.5
 
 
+class ClusterInfo(BaseModel):
+    cluster_id: int
+    peak_indices: List[int]
+    masses: List[float]
+    intensities: List[float]
+    monoisotopic_mass: float
+
+
 class DeisotopeResponse(BaseModel):
-    labels: List[int]
-    num_clusters: int
     num_peaks: int
+    num_clusters: int
+    num_unassigned: int
+    clusters: List[ClusterInfo]
 
 
 class CheckFormulaRequest(BaseModel):
@@ -152,11 +161,17 @@ class CheckFormulaResponse(BaseModel):
     matched_intensities: List[float]
 
 
+class ClusterInput(BaseModel):
+    cluster_id: int
+    peak_indices: List[int]
+
+
 class PredictFormulaRequest(BaseModel):
     spectrum_id: Optional[str] = None
     masses: Optional[List[float]] = None
     intensities: Optional[List[float]] = None
-    peak_indices: List[int]
+    peak_indices: Optional[List[int]] = None
+    clusters: Optional[List[ClusterInput]] = None
 
 
 class ElementPrediction(BaseModel):
@@ -164,8 +179,16 @@ class ElementPrediction(BaseModel):
     count: float
 
 
-class PredictFormulaResponse(BaseModel):
+class FormulaPrediction(BaseModel):
+    cluster_id: int
+    monoisotopic_mass: float
+    suggested_formula: str
+    mass_error_ppm: float
     elements: List[ElementPrediction]
+
+
+class PredictFormulaResponse(BaseModel):
+    predictions: List[FormulaPrediction]
 
 
 class LoadPeaklistRequest(BaseModel):
@@ -208,13 +231,35 @@ def deisotope(req: DeisotopeRequest):
 
     deisotoper = deisotoping_models[req.model]
     labels = deisotoper.run(spectrum, threshold=req.threshold)
-    labels_list = [int(l) for l in labels]
-    num_clusters = len(set(l for l in labels_list if l >= 0))
+
+    cluster_peaks: dict = {}
+    num_unassigned = 0
+    for idx, label in enumerate(labels):
+        label = int(label)
+        if label < 0:
+            num_unassigned += 1
+            continue
+        cluster_peaks.setdefault(label, []).append(idx)
+
+    clusters = []
+    for cid, indices in sorted(cluster_peaks.items()):
+        c_masses = [float(spectrum.masses[i]) for i in indices]
+        c_ints = [float(spectrum.ints[i]) for i in indices]
+        clusters.append(ClusterInfo(
+            cluster_id=cid,
+            peak_indices=indices,
+            masses=c_masses,
+            intensities=c_ints,
+            monoisotopic_mass=c_masses[0],
+        ))
+
+    clusters.sort(key=lambda c: c.intensities[0], reverse=True)
 
     return DeisotopeResponse(
-        labels=labels_list,
-        num_clusters=num_clusters,
-        num_peaks=len(labels_list),
+        num_peaks=len(labels),
+        num_clusters=len(clusters),
+        num_unassigned=num_unassigned,
+        clusters=clusters,
     )
 
 
@@ -251,16 +296,25 @@ def check_formula(req: CheckFormulaRequest):
     )
 
 
-@app.post("/predict-formula", response_model=PredictFormulaResponse)
-def predict_formula(req: PredictFormulaRequest):
-    spectrum = _resolve_spectrum(req.masses, req.intensities, req.spectrum_id)
+def _build_formula_string(elements: List[ElementPrediction]) -> str:
+    parts: dict = {}
+    for e in elements:
+        n = round(e.count)
+        if n > 0:
+            parts[e.symbol] = n
+    ordered = []
+    if "C" in parts:
+        ordered.append(("C", parts.pop("C")))
+    if "H" in parts:
+        ordered.append(("H", parts.pop("H")))
+    for sym in sorted(parts.keys()):
+        ordered.append((sym, parts[sym]))
+    return "".join(f"{sym}{n}" if n > 1 else sym for sym, n in ordered)
 
-    if mlp_model is None:
-        raise HTTPException(status_code=503, detail="MLP model not loaded")
 
-    rid = RealIsotopicDistribution(spectrum, req.peak_indices)
+def _predict_one_cluster(spectrum, peak_indices, cluster_id):
+    rid = RealIsotopicDistribution(spectrum, peak_indices)
     representations = rid.get_representation(length=mlp_vector_length + 1)
-
     vectors = [rep[0] for rep in representations]
     input_tensor = torch.tensor(np.array(vectors), dtype=torch.float32)
 
@@ -274,11 +328,42 @@ def predict_formula(req: PredictFormulaRequest):
         count = float(avg_output[idx])
         element_number = idx + 1
         if count > 0.5 and element_number in ELEMENT_DICT:
-            elements.append(
-                ElementPrediction(symbol=ELEMENT_DICT[element_number], count=count)
-            )
+            elements.append(ElementPrediction(symbol=ELEMENT_DICT[element_number], count=count))
 
-    return PredictFormulaResponse(elements=elements)
+    formula_str = _build_formula_string(elements)
+    mono_mass = float(spectrum.masses[peak_indices[0]])
+
+    mass_error = 0.0
+    if formula_str:
+        try:
+            theoretical = Formula(formula_str).monoisotopic_mass
+            mass_error = abs(theoretical - mono_mass) / mono_mass * 1e6
+        except Exception:
+            pass
+
+    return FormulaPrediction(
+        cluster_id=cluster_id,
+        monoisotopic_mass=mono_mass,
+        suggested_formula=formula_str,
+        mass_error_ppm=round(mass_error, 3),
+        elements=elements,
+    )
+
+
+@app.post("/predict-formula", response_model=PredictFormulaResponse)
+def predict_formula(req: PredictFormulaRequest):
+    spectrum = _resolve_spectrum(req.masses, req.intensities, req.spectrum_id)
+
+    if mlp_model is None:
+        raise HTTPException(status_code=503, detail="MLP model not loaded")
+
+    if not req.clusters and not req.peak_indices:
+        raise HTTPException(status_code=400, detail="Provide clusters or peak_indices")
+
+    cluster_inputs = req.clusters or [ClusterInput(cluster_id=0, peak_indices=req.peak_indices)]
+    predictions = [_predict_one_cluster(spectrum, c.peak_indices, c.cluster_id) for c in cluster_inputs]
+
+    return PredictFormulaResponse(predictions=predictions)
 
 
 MASS_COLUMN_NAMES = ["m/z", "mz", "mass", "t_mass", "measured mass", "obs. m/z", "m_z"]
