@@ -27,7 +27,8 @@ from mass_automation.deisotoping.process import MlDeisotoper
 from mass_automation.experiment import Spectrum
 from mass_automation.formula import Formula, RealIsotopicDistribution
 from mass_automation.formula.check_formula import check_presence
-from mass_automation.formula.model import MLP
+from mass_automation.formula.determination import brute_force_search
+from mass_automation.formula.model import LSTM, MLP
 from mass_automation.utils import ELEMENT_DICT
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,9 @@ app = FastAPI(title="MEDUSA", description="Mass spectrometry analysis API")
 deisotoping_models: dict = {}
 mlp_model: MLP = None
 mlp_vector_length: int = 500  # will be set from checkpoint hparams
+classifier_model = None
+classifier_type: str = ""
+classifier_vector_length: int = 500
 
 # --- Server-side spectrum store ---
 
@@ -97,6 +101,65 @@ def load_models():
     except Exception as e:
         logger.warning(f"  Could not load MLP: {e}")
 
+    _load_classifier()
+    _load_regression_model()
+
+
+def _load_classifier():
+    global classifier_model, classifier_type, classifier_vector_length
+    from mass_automation.formula.model import LinearWithHidden
+    from mass_automation.utils import Element
+
+    candidates = [
+        ("lstm_bi", "nn_models/classification/lstm_bi_clf_full.ckpt"),
+        ("mlp", "nn_models/classification/mlp_clf_0.25.ckpt"),
+    ]
+    for name, path in candidates:
+        if not os.path.exists(path):
+            continue
+        logger.info(f"Loading classifier: {path}")
+        try:
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+            hparams = checkpoint.get("hyper_parameters", {})
+            sd = checkpoint.get("state_dict", {})
+
+            if name.startswith("lstm"):
+                model = LSTM(
+                    lstm_in_size=hparams.get("lstm_in_size", 100),
+                    lstm_hidden_size=hparams.get("lstm_hidden_size", 256),
+                    lstm_num_layers=hparams.get("lstm_num_layers", 3),
+                    lstm_bidirectional=hparams.get("lstm_bidirectional", True),
+                    lstm_dropout=hparams.get("lstm_dropout", 0.5),
+                    decoder_hidden_size=hparams.get("decoder_hidden_size", 128),
+                    activation=hparams.get("activation", True),
+                    loss=hparams.get("loss", "CE"),
+                )
+                model.load_state_dict(sd)
+                model.eval()
+                classifier_model = model
+                classifier_type = "lstm"
+                classifier_vector_length = hparams.get("lstm_in_size", 100)
+            else:
+                in_size = hparams.get("in_size", 500)
+                hidden_size = hparams.get("hidden_size", 256)
+                activation = hparams.get("activation", True)
+                model = torch.nn.Module()
+                model.mlp = LinearWithHidden(in_size, hidden_size, Element.n_elements, activation)
+                model.forward = lambda x: model.mlp(x)
+                mlp_sd = {k: v for k, v in sd.items() if k.startswith("mlp.")}
+                model.load_state_dict(mlp_sd)
+                model.eval()
+                classifier_model = model
+                classifier_type = "mlp"
+                classifier_vector_length = in_size
+
+            logger.info(f"  Classifier loaded: {name} (type={classifier_type}, vec_len={classifier_vector_length})")
+            return
+        except Exception as e:
+            logger.warning(f"  Could not load classifier {name}: {e}")
+
+    logger.warning("  No classifier model loaded")
+
 
 # --- Helpers ---
 
@@ -126,6 +189,7 @@ class DeisotopeRequest(BaseModel):
     intensities: Optional[List[float]] = None
     model: str = "cb"
     threshold: float = 0.5
+    skip_peak_finding: Optional[bool] = None
 
 
 class ClusterInfo(BaseModel):
@@ -191,6 +255,38 @@ class PredictFormulaResponse(BaseModel):
     predictions: List[FormulaPrediction]
 
 
+class AssignFormulaRequest(BaseModel):
+    spectrum_id: Optional[str] = None
+    masses: Optional[List[float]] = None
+    intensities: Optional[List[float]] = None
+    clusters: Optional[List[ClusterInput]] = None
+    peak_indices: Optional[List[int]] = None
+    mass_tolerance_ppm: float = 2.0
+    max_results: int = 5
+    elements: Optional[List[str]] = None
+    classifier_threshold: float = 0.5
+
+
+class FormulaCandidate(BaseModel):
+    formula: str
+    monoisotopic_mass: float
+    theoretical_mass: float
+    mass_error_ppm: float
+    cosine_distance: float
+    matched_percentage: float
+
+
+class ClusterAssignment(BaseModel):
+    cluster_id: int
+    monoisotopic_mass: float
+    detected_elements: List[str]
+    candidates: List[FormulaCandidate]
+
+
+class AssignFormulaResponse(BaseModel):
+    assignments: List[ClusterAssignment]
+
+
 class LoadPeaklistRequest(BaseModel):
     file_path: str
     mass_column: Optional[str] = None
@@ -215,6 +311,10 @@ def health():
         "status": "ok",
         "deisotoping_models": list(deisotoping_models.keys()),
         "mlp_loaded": mlp_model is not None,
+        "classifier_loaded": classifier_model is not None,
+        "classifier_type": classifier_type or None,
+        "regression_loaded": regression_model is not None,
+        "regression_type": regression_type or None,
         "loaded_spectra": len(spectra_store),
     }
 
@@ -230,7 +330,24 @@ def deisotope(req: DeisotopeRequest):
         )
 
     deisotoper = deisotoping_models[req.model]
-    labels = deisotoper.run(spectrum, threshold=req.threshold)
+
+    skip = req.skip_peak_finding
+    if skip is None and req.spectrum_id:
+        skip = spectra_store.get(req.spectrum_id, {}).get("from_peaklist", False)
+
+    if skip:
+        original_find_peaks = deisotoper.find_peaks
+        def _all_peaks(spectrum):
+            peaks = np.arange(len(spectrum.masses))
+            deisotoper.denoised_labels = np.zeros(len(spectrum.masses))
+            return peaks
+        deisotoper.find_peaks = _all_peaks
+        try:
+            labels = deisotoper.run(spectrum, threshold=req.threshold)
+        finally:
+            deisotoper.find_peaks = original_find_peaks
+    else:
+        labels = deisotoper.run(spectrum, threshold=req.threshold)
 
     cluster_peaks: dict = {}
     num_unassigned = 0
@@ -366,6 +483,322 @@ def predict_formula(req: PredictFormulaRequest):
     return PredictFormulaResponse(predictions=predictions)
 
 
+DEFAULT_ORGANIC_ELEMENTS = ["C", "H", "N", "O", "S", "P"]
+
+ELECTRON_MASS = 0.00054858
+
+# Per-element search window half-width (DELTA) around the NN prediction
+ELEMENT_DELTA = {
+    "C": 5, "H": 15, "N": 4, "O": 6, "S": 3, "P": 3,
+    "F": 3, "Cl": 3, "Br": 2, "Si": 3, "Na": 2, "K": 2,
+}
+DEFAULT_DELTA = 3
+
+# Regression model singletons
+regression_model = None
+regression_type: str = ""
+regression_vector_length: int = 100
+regression_normalizer = None
+
+
+def _load_regression_model():
+    global regression_model, regression_type, regression_vector_length, regression_normalizer
+    from mass_automation.formula.model import LinearWithHidden
+    from mass_automation.utils import Element
+    from mass_automation.formula.data import normalizers
+
+    candidates = [
+        ("lstm_bi", "nn_models/regression/lstm_bi_full.ckpt"),
+        ("mlp", "nn_models/regression/mlp_0.25.ckpt"),
+    ]
+    for name, path in candidates:
+        if not os.path.exists(path):
+            continue
+        logger.info(f"Loading regression model: {path}")
+        try:
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+            hparams = checkpoint.get("hyper_parameters", {})
+            sd = checkpoint.get("state_dict", {})
+            norm_name = hparams.get("data_converter_settings_normalizer", "means")
+
+            if name.startswith("lstm"):
+                in_sz = hparams.get("lstm_in_size", 100)
+                hid_sz = hparams.get("lstm_hidden_size", 256)
+                n_layers = hparams.get("lstm_num_layers", 3)
+                bidir = hparams.get("lstm_bidirectional", True)
+                drop = hparams.get("lstm_dropout", 0.5)
+                dec_hid = hparams.get("decoder_hidden_size", 512)
+                act = hparams.get("activation", False)
+
+                model = types.SimpleNamespace()
+                model.lstm = torch.nn.LSTM(in_sz, hid_sz, n_layers,
+                                           bidirectional=bidir, dropout=drop)
+                dec_in = hid_sz * (2 if bidir else 1) * n_layers
+                model.decoder = LinearWithHidden(dec_in, dec_hid, Element.n_elements, act)
+
+                lstm_sd = {k.replace("lstm.", "", 1): v for k, v in sd.items() if k.startswith("lstm.")}
+                dec_sd = {k.replace("decoder.", "", 1): v for k, v in sd.items() if k.startswith("decoder.")}
+                model.lstm.load_state_dict(lstm_sd)
+                model.decoder.load_state_dict(dec_sd)
+                model.lstm.eval()
+                model.decoder.eval()
+                regression_model = model
+                regression_type = "lstm"
+                regression_vector_length = in_sz
+            else:
+                in_size = hparams.get("in_size", 100)
+                hidden_size = hparams.get("hidden_size", 50)
+                activation = hparams.get("activation", True)
+                model = torch.nn.Module()
+                model.mlp = LinearWithHidden(in_size, hidden_size, Element.n_elements, activation)
+                model.forward = lambda x: model.mlp(x)
+                mlp_sd = {k: v for k, v in sd.items() if k.startswith("mlp.")}
+                model.load_state_dict(mlp_sd)
+                model.eval()
+                regression_model = model
+                regression_type = "mlp"
+                regression_vector_length = in_size
+
+            regression_normalizer = normalizers.get(norm_name, normalizers["means"])
+            logger.info(f"  Regression model loaded: {name} (normalizer={norm_name})")
+            return
+        except Exception as e:
+            logger.warning(f"  Could not load regression model {name}: {e}")
+
+    logger.warning("  No regression model loaded")
+
+
+def _classify_elements(spectrum, peak_indices, threshold=0.5):
+    rid = RealIsotopicDistribution(spectrum, peak_indices)
+    vec_length = classifier_vector_length
+
+    representations = rid.get_representation(length=vec_length + 1)
+    vectors = [rep[0] for rep in representations]
+
+    if classifier_type == "lstm":
+        input_tensor = torch.tensor(np.array(vectors), dtype=torch.float32).unsqueeze(1)
+        with torch.no_grad():
+            output = classifier_model(input_tensor)
+        probs = output.squeeze(0).numpy()
+    else:
+        input_tensor = torch.tensor(np.array(vectors), dtype=torch.float32)
+        with torch.no_grad():
+            output = classifier_model(input_tensor)
+        probs = output.mean(dim=0).numpy()
+
+    detected = []
+    for idx in range(len(probs)):
+        if probs[idx] > threshold and (idx + 1) in ELEMENT_DICT:
+            detected.append(ELEMENT_DICT[idx + 1])
+    return detected
+
+
+def _regress_element_counts(spectrum, peak_indices):
+    """Run regression NN to get rough element count estimates (following the paper's approach).
+
+    Mirrors the preprocessing from the training pipeline:
+    - generate_fake_representation uses default length=100
+    - data.py OriginalFormulaDataset drops the last vector element, appends mass/1000
+    - So input is 100-dim: 99 spectral bins + mass/1000
+    """
+    rid = RealIsotopicDistribution(spectrum, peak_indices)
+    vec_length = regression_vector_length
+    representations = rid.get_representation(
+        f=np.mean, mode="middle", length=vec_length + 1
+    )
+
+    centered = []
+    for vec, peak_mass in representations:
+        cv = vec[:vec_length].copy()
+        half = vec_length // 2
+        window = max(0, half - 10)
+        center = np.argmax(cv[window:half + 10]) - half + window
+        med = np.median(cv)
+        cv[:20] = med
+        cv[-20:] = med
+        if center < 0:
+            cv = np.array([med] * (-center) + list(cv[:center]))
+        elif center > 0:
+            cv = np.array(list(cv[center:]) + [med] * center)
+        cv = cv - med
+        cv[-1] = peak_mass / 1000.0
+        centered.append(cv)
+
+    if not centered:
+        return np.zeros(119, dtype=int)
+
+    sum_ = max(item.max() for item in centered)
+    if sum_ > 0:
+        centered = [item / sum_ for item in centered]
+
+    if regression_type == "lstm":
+        seq = torch.FloatTensor(np.array(centered))
+        input_tensor = seq.unsqueeze(1)
+        with torch.no_grad():
+            _, (h, _) = regression_model.lstm(input_tensor)
+            h = h.permute(1, 0, 2).flatten(1)
+            output = regression_model.decoder(h)
+        raw = output[0].numpy()
+    else:
+        input_tensor = torch.tensor(np.array(centered), dtype=torch.float32)
+        with torch.no_grad():
+            output = regression_model(input_tensor)
+        raw = output.mean(dim=0).numpy()
+
+    denorm = regression_normalizer(1) if callable(regression_normalizer) else 1.0
+    counts = (raw * denorm).round().astype(int)
+    return counts
+
+
+def _nn_guided_search(spectrum, peak_indices, elements, max_results,
+                      search_tolerance_da, ppm_filter):
+    """Paper's approach: NN regression centers the search, brute force refines within a window."""
+    from pyteomics.mass import calculate_mass as calc_mass
+    from mass_automation.utils import Element
+
+    nn_counts = _regress_element_counts(spectrum, peak_indices)
+
+    el_indices = [getattr(Element, e) - 1 for e in elements]
+    el_masses = [calc_mass(e + "1") for e in elements]
+    nn_pred = [max(0, int(nn_counts[idx])) for idx in el_indices]
+
+    low_limits = []
+    high_limits = []
+    for e, pred in zip(elements, nn_pred):
+        delta = ELEMENT_DELTA.get(e, DEFAULT_DELTA)
+        low_limits.append(max(0, pred - delta))
+        high_limits.append(pred + delta + 1)
+
+    sorted_idx = sorted(range(len(elements)), key=lambda i: el_masses[i], reverse=True)
+    elements_s = [elements[i] for i in sorted_idx]
+    el_masses_s = [el_masses[i] for i in sorted_idx]
+    low_s = [low_limits[i] for i in sorted_idx]
+    high_s = [high_limits[i] for i in sorted_idx]
+
+    distr_masses = [float(spectrum.masses[i]) for i in peak_indices]
+
+    all_candidates = {}
+
+    for obs_mass in distr_masses:
+        search_mass = obs_mass + ELECTRON_MASS
+        mass_matched = []
+
+        def recurse(depth, current_mass, counts):
+            if current_mass > search_mass + search_tolerance_da:
+                return
+            if depth == len(elements_s):
+                if abs(current_mass - search_mass) <= search_tolerance_da:
+                    mass_matched.append(list(counts))
+                return
+            em = el_masses_s[depth]
+            max_n = min(high_s[depth],
+                        int((search_mass + search_tolerance_da - current_mass) / em) + 1)
+            for n in range(low_s[depth], max_n + 1):
+                counts[depth] = n
+                recurse(depth + 1, current_mass + n * em, counts)
+                if len(mass_matched) >= 500:
+                    return
+            counts[depth] = low_s[depth]
+
+        recurse(0, 0.0, [low_s[i] for i in range(len(elements_s))])
+
+        for counts in mass_matched:
+            formula_dict = {el: c for el, c in zip(elements_s, counts) if c > 0}
+            if not formula_dict:
+                continue
+            key = tuple(sorted(formula_dict.items()))
+            if key in all_candidates:
+                continue
+            formula_str = _dict_to_hill(formula_dict)
+            try:
+                cos_dist, _, matched_pct, mass_err = check_presence(
+                    spectrum, Formula(formula_str), cal_error=0.006, dist_error=0.003
+                )
+                cos_dist = float(cos_dist)
+                if math.isnan(cos_dist) or math.isinf(cos_dist):
+                    continue
+                theoretical = Formula(formula_str).monoisotopic_mass
+                mono_mass = float(spectrum.masses[peak_indices[0]])
+                actual_ppm = abs(theoretical - mono_mass) / mono_mass * 1e6
+                if actual_ppm > ppm_filter:
+                    continue
+                all_candidates[key] = FormulaCandidate(
+                    formula=formula_str,
+                    monoisotopic_mass=mono_mass,
+                    theoretical_mass=round(theoretical, 6),
+                    mass_error_ppm=round(actual_ppm, 3),
+                    cosine_distance=round(cos_dist, 6),
+                    matched_percentage=round(float(matched_pct), 4),
+                )
+            except Exception:
+                continue
+
+    results = sorted(all_candidates.values(), key=lambda c: c.cosine_distance)
+    return results[:max_results]
+
+
+def _assign_one_cluster(spectrum, peak_indices, cluster_id, mass_tolerance_ppm,
+                        max_results, forced_elements, classifier_threshold):
+    mono_mass = float(spectrum.masses[peak_indices[0]])
+    search_tolerance_da = 5e-3
+
+    if forced_elements:
+        elements = forced_elements
+    elif classifier_model is not None:
+        detected = _classify_elements(spectrum, peak_indices, classifier_threshold)
+        elements = list(set(DEFAULT_ORGANIC_ELEMENTS) | set(detected))
+    else:
+        elements = list(DEFAULT_ORGANIC_ELEMENTS)
+
+    if regression_model is not None:
+        candidates = _nn_guided_search(
+            spectrum, peak_indices, elements, max_results,
+            search_tolerance_da, ppm_filter=mass_tolerance_ppm,
+        )
+    else:
+        candidates = []
+
+    return ClusterAssignment(
+        cluster_id=cluster_id,
+        monoisotopic_mass=mono_mass,
+        detected_elements=elements,
+        candidates=candidates,
+    )
+
+
+def _dict_to_hill(d: dict) -> str:
+    ordered = []
+    if "C" in d:
+        ordered.append(("C", d["C"]))
+    if "H" in d:
+        ordered.append(("H", d["H"]))
+    for sym in sorted(d.keys()):
+        if sym not in ("C", "H"):
+            ordered.append((sym, d[sym]))
+    return "".join(f"{sym}{n}" if n > 1 else sym for sym, n in ordered)
+
+
+@app.post("/assign-formula", response_model=AssignFormulaResponse)
+def assign_formula(req: AssignFormulaRequest):
+    spectrum = _resolve_spectrum(req.masses, req.intensities, req.spectrum_id)
+
+    if not req.clusters and not req.peak_indices:
+        raise HTTPException(status_code=400, detail="Provide clusters or peak_indices")
+
+    cluster_inputs = req.clusters or [ClusterInput(cluster_id=0, peak_indices=req.peak_indices)]
+
+    assignments = []
+    for c in cluster_inputs:
+        assignment = _assign_one_cluster(
+            spectrum, c.peak_indices, c.cluster_id,
+            req.mass_tolerance_ppm, req.max_results,
+            req.elements, req.classifier_threshold,
+        )
+        assignments.append(assignment)
+
+    return AssignFormulaResponse(assignments=assignments)
+
+
 MASS_COLUMN_NAMES = ["m/z", "mz", "mass", "t_mass", "measured mass", "obs. m/z", "m_z"]
 INTENSITY_COLUMN_NAMES = ["intensity", "int", "i", "abs. intensity", "rel. intensity", "height"]
 
@@ -424,6 +857,7 @@ def load_peaklist(req: LoadPeaklistRequest):
     spectra_store[sid] = {
         "spectrum": Spectrum(masses=masses, ints=intensities),
         "file": fp,
+        "from_peaklist": True,
     }
 
     return LoadPeaklistResponse(
