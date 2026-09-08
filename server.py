@@ -1,7 +1,9 @@
+import json
 import logging
 import math
 import os
 import sys
+import tempfile
 import types
 import uuid
 from typing import Dict, List, Optional
@@ -34,6 +36,9 @@ from mass_automation.utils import ELEMENT_DICT
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="MEDUSA", description="Mass spectrometry analysis API")
+
+RESULTS_DIR = os.environ.get("MEDUSA_RESULTS_DIR", "/tmp/medusa-results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # --- Model singletons (loaded at startup) ---
 
@@ -190,21 +195,24 @@ class DeisotopeRequest(BaseModel):
     model: str = "cb"
     threshold: float = 0.5
     skip_peak_finding: Optional[bool] = None
+    compact: bool = True
 
 
 class ClusterInfo(BaseModel):
     cluster_id: int
     peak_indices: List[int]
-    masses: List[float]
-    intensities: List[float]
+    masses: Optional[List[float]] = None
+    intensities: Optional[List[float]] = None
     monoisotopic_mass: float
+    num_peaks: Optional[int] = None
 
 
 class DeisotopeResponse(BaseModel):
     num_peaks: int
     num_clusters: int
     num_unassigned: int
-    clusters: List[ClusterInfo]
+    result_file: Optional[str] = None
+    clusters: Optional[List[ClusterInfo]] = None
 
 
 class CheckFormulaRequest(BaseModel):
@@ -236,6 +244,7 @@ class PredictFormulaRequest(BaseModel):
     intensities: Optional[List[float]] = None
     peak_indices: Optional[List[int]] = None
     clusters: Optional[List[ClusterInput]] = None
+    result_file: Optional[str] = None
 
 
 class ElementPrediction(BaseModel):
@@ -261,6 +270,7 @@ class AssignFormulaRequest(BaseModel):
     intensities: Optional[List[float]] = None
     clusters: Optional[List[ClusterInput]] = None
     peak_indices: Optional[List[int]] = None
+    result_file: Optional[str] = None
     mass_tolerance_ppm: float = 2.0
     max_results: int = 5
     elements: Optional[List[str]] = None
@@ -319,7 +329,7 @@ def health():
     }
 
 
-@app.post("/deisotope", response_model=DeisotopeResponse)
+@app.post("/deisotope", response_model=DeisotopeResponse, response_model_exclude_none=True)
 def deisotope(req: DeisotopeRequest):
     spectrum = _resolve_spectrum(req.masses, req.intensities, req.spectrum_id)
 
@@ -358,24 +368,43 @@ def deisotope(req: DeisotopeRequest):
             continue
         cluster_peaks.setdefault(label, []).append(idx)
 
-    clusters = []
+    full_clusters = []
     for cid, indices in sorted(cluster_peaks.items()):
         c_masses = [float(spectrum.masses[i]) for i in indices]
         c_ints = [float(spectrum.ints[i]) for i in indices]
-        clusters.append(ClusterInfo(
-            cluster_id=cid,
-            peak_indices=indices,
-            masses=c_masses,
-            intensities=c_ints,
-            monoisotopic_mass=c_masses[0],
-        ))
+        full_clusters.append({
+            "cluster_id": cid,
+            "peak_indices": indices,
+            "masses": c_masses,
+            "intensities": c_ints,
+            "monoisotopic_mass": c_masses[0],
+            "num_peaks": len(indices),
+            "_sort_key": c_ints[0],
+        })
 
-    clusters.sort(key=lambda c: c.intensities[0], reverse=True)
+    full_clusters.sort(key=lambda x: x["_sort_key"], reverse=True)
+    for c in full_clusters:
+        del c["_sort_key"]
 
+    result_id = str(uuid.uuid4())[:8]
+    result_path = os.path.join(RESULTS_DIR, f"deisotope_{result_id}.json")
+    with open(result_path, "w") as f:
+        json.dump({"clusters": full_clusters}, f)
+
+    if req.compact:
+        return DeisotopeResponse(
+            num_peaks=len(labels),
+            num_clusters=len(full_clusters),
+            num_unassigned=num_unassigned,
+            result_file=result_path,
+        )
+
+    clusters = [ClusterInfo(**c) for c in full_clusters]
     return DeisotopeResponse(
         num_peaks=len(labels),
-        num_clusters=len(clusters),
+        num_clusters=len(full_clusters),
         num_unassigned=num_unassigned,
+        result_file=result_path,
         clusters=clusters,
     )
 
@@ -474,10 +503,16 @@ def predict_formula(req: PredictFormulaRequest):
     if mlp_model is None:
         raise HTTPException(status_code=503, detail="MLP model not loaded")
 
-    if not req.clusters and not req.peak_indices:
-        raise HTTPException(status_code=400, detail="Provide clusters or peak_indices")
+    if req.result_file and not req.clusters and not req.peak_indices:
+        try:
+            cluster_inputs = _load_clusters_from_file(req.result_file)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Cannot read result_file: {e}")
+    elif req.clusters or req.peak_indices:
+        cluster_inputs = req.clusters or [ClusterInput(cluster_id=0, peak_indices=req.peak_indices)]
+    else:
+        raise HTTPException(status_code=400, detail="Provide clusters, peak_indices, or result_file")
 
-    cluster_inputs = req.clusters or [ClusterInput(cluster_id=0, peak_indices=req.peak_indices)]
     predictions = [_predict_one_cluster(spectrum, c.peak_indices, c.cluster_id) for c in cluster_inputs]
 
     return PredictFormulaResponse(predictions=predictions)
@@ -778,14 +813,26 @@ def _dict_to_hill(d: dict) -> str:
     return "".join(f"{sym}{n}" if n > 1 else sym for sym, n in ordered)
 
 
+def _load_clusters_from_file(path: str) -> List[ClusterInput]:
+    with open(path, "r") as f:
+        data = json.load(f)
+    return [ClusterInput(cluster_id=c["cluster_id"], peak_indices=c["peak_indices"])
+            for c in data["clusters"]]
+
+
 @app.post("/assign-formula", response_model=AssignFormulaResponse)
 def assign_formula(req: AssignFormulaRequest):
     spectrum = _resolve_spectrum(req.masses, req.intensities, req.spectrum_id)
 
-    if not req.clusters and not req.peak_indices:
-        raise HTTPException(status_code=400, detail="Provide clusters or peak_indices")
-
-    cluster_inputs = req.clusters or [ClusterInput(cluster_id=0, peak_indices=req.peak_indices)]
+    if req.result_file and not req.clusters and not req.peak_indices:
+        try:
+            cluster_inputs = _load_clusters_from_file(req.result_file)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Cannot read result_file: {e}")
+    elif req.clusters or req.peak_indices:
+        cluster_inputs = req.clusters or [ClusterInput(cluster_id=0, peak_indices=req.peak_indices)]
+    else:
+        raise HTTPException(status_code=400, detail="Provide clusters, peak_indices, or result_file")
 
     assignments = []
     for c in cluster_inputs:
